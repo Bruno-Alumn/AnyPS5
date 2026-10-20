@@ -7,6 +7,7 @@
 #include "CompiledVariant.hpp"
 #include "ShaderDiskCache.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -74,6 +75,35 @@ void ClosingJoinsPreparation() {
     SubmitRegistrationPreparation([&] { ranHere = std::this_thread::get_id() == caller; });
     SubmitLibraryPrebuild([&] { ranHere = ranHere && std::this_thread::get_id() == caller; });
     Require(ranHere && RegistrationPreparationThreads() == 0, "a closed preparation pool restarted after being joined");
+}
+
+void ClosingDropsQueuedPrebuilds() {
+    using namespace AgcDriver::DriverDetail;
+    SetEnvironment("APS5_PREBUILD_THREADS", "1");
+    std::promise<void> started;
+    auto running = started.get_future();
+    std::promise<void> gate;
+    auto opened = gate.get_future().share();
+    bool runningFinished = false;
+    std::atomic<int> queuedRan{0};
+    SubmitLibraryPrebuild([&] {
+        started.set_value();
+        opened.wait();
+        runningFinished = true;
+    });
+    running.wait();
+    for (int index = 0; index < 3; ++index) SubmitLibraryPrebuild([&] { queuedRan.fetch_add(1); });
+    auto awaiting = std::async(std::launch::async, [] { AwaitLibraryPrebuilds(); });
+    auto closing = std::async(std::launch::async, [] { CloseRegistrationPreparation(); });
+    const bool waited = closing.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
+    gate.set_value();
+    closing.get();
+    const bool awaited = awaiting.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    Require(waited, "closing returned while a library prebuild was still running");
+    Require(runningFinished, "closing did not let the running library prebuild finish");
+    Require(queuedRan.load() == 0, "closing ran library prebuilds that had not started");
+    Require(awaited, "closing left a library prebuild waiter blocked on the dropped prebuilds");
+    Require(RegistrationPreparationThreads() == 0, "closing the shader preparation left its threads running");
 }
 
 void StoppingJoinsCompareHelpers() {
@@ -168,6 +198,7 @@ int main(int argc, char** argv) {
     try {
         const std::string_view mode = argc > 1 ? argv[1] : "";
         if (mode == "--joined") ClosingJoinsPreparation();
+        else if (mode == "--queued-prebuilds") ClosingDropsQueuedPrebuilds();
         else if (mode == "--compare-helpers") StoppingJoinsCompareHelpers();
         else if (mode == "--draw-committer") ShutdownJoinsDrawCommitter();
         else if (mode == "--shader-cache-writer") ShutdownJoinsShaderCacheWriter();

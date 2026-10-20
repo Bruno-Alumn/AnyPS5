@@ -1146,9 +1146,8 @@ public:
             Closing() = true;
             pools = {Existing(), ExistingPrebuild()};
         }
-        for (auto* pool : pools) {
-            if (pool != nullptr) pool->Close();
-        }
+        if (pools[0] != nullptr) pools[0]->Close(false);
+        if (pools[1] != nullptr) pools[1]->Close(true);
     }
 
 private:
@@ -1204,11 +1203,17 @@ public:
         idle.wait(lock, [&] { return unfinished.empty() || *unfinished.begin() > ticket; });
     }
 
-    void Close() {
+    void Close(bool discardQueued) {
         std::vector<Worker> joined;
+        std::deque<Task> discarded;
         {
             std::unique_lock lock(mutex);
             closed = true;
+            if (discardQueued) {
+                discarded.swap(tasks);
+                for (const auto& task : discarded) unfinished.erase(task.sequence);
+                idle.notify_all();
+            }
             idle.wait(lock, [&] { return tasks.empty() && running == 0; });
             joined.swap(workers);
         }
